@@ -1,16 +1,21 @@
 import React, { useEffect, useState, useRef } from 'react';
 import io from 'socket.io-client';
+import NodeRSA from 'node-rsa';
 
 const AuctionClient = () => {
+  // Estados e referências mantidos
   const [currentItem, setCurrentItem] = useState(null);
   const [newBid, setNewBid] = useState('');
   const [user, setUser] = useState('');
   const [cpf, setCPF] = useState('');
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [publicKey, setPublicKey] = useState('');
+  const [symmetricKey, setSymmetricKey] = useState(null);
+  const [multicastAddress, setMulticastAddress] = useState(null);
   const socketRef = useRef();
 
-  const generateKeyPair = async () => {
+  // Função de geração de chaves (mesma lógica já usada)
+  const generateKeyPair = () => {
     const storedPrivateKey = localStorage.getItem('privateKey');
     const storedPublicKey = localStorage.getItem('publicKey');
 
@@ -19,78 +24,56 @@ const AuctionClient = () => {
       setPublicKey(storedPublicKey);
     } else {
       console.log('Gerando novo par de chaves...');
-      const keyPair = await window.crypto.subtle.generateKey(
-        {
-          name: 'RSA-OAEP',
-          modulusLength: 2048,
-          publicExponent: new Uint8Array([1, 0, 1]),
-          hash: { name: 'SHA-256' },
-        },
-        true,
-        ['encrypt', 'decrypt']
-      );
+      const key = new NodeRSA({ b: 2048 });
+      key.setOptions({ encryptionScheme: 'pkcs1' });
 
       // Exportar e armazenar a chave pública
-      const exportedPublicKey = await window.crypto.subtle.exportKey('spki', keyPair.publicKey);
-      const publicKeyBase64 = btoa(String.fromCharCode(...new Uint8Array(exportedPublicKey)));
-      localStorage.setItem('publicKey', publicKeyBase64);
+      const publicKey = key.exportKey('public');
+      localStorage.setItem('publicKey', publicKey);
 
       // Exportar e armazenar a chave privada
-      const exportedPrivateKey = await window.crypto.subtle.exportKey('pkcs8', keyPair.privateKey);
-      const privateKeyBase64 = btoa(String.fromCharCode(...new Uint8Array(exportedPrivateKey)));
-      localStorage.setItem('privateKey', privateKeyBase64);
+      const privateKey = key.exportKey('private');
+      localStorage.setItem('privateKey', privateKey);
 
-      setPublicKey(publicKeyBase64);
+      setPublicKey(publicKey);
     }
   };
 
-  const clearSession = () => {
-    localStorage.removeItem('privateKey');
-    setIsAuthenticated(false);
-    setUser('');
-    setCPF('');
-    setPublicKey('');
-    if (socketRef.current) {
-      socketRef.current.disconnect();
-    }
-  };
+  // Função para descriptografar com a chave privada
+  const decryptWithPrivateKey = (privateKey, encryptedMessage) => {
+    const key = new NodeRSA();
+    key.setOptions({ encryptionScheme: 'pkcs1' });
+    key.importKey(privateKey, 'private');
+    return key.decrypt(encryptedMessage, 'utf8');
+};
 
-  useEffect(() => {
-    if (isAuthenticated) {
-      socketRef.current = io('http://localhost:3000');
-      socketRef.current.on('currentItem', (item) => {
-        setCurrentItem(item);
-      });
-
-      return () => {
-        socketRef.current.disconnect();
-      };
-    }
-  }, [isAuthenticated]);
-
-  const handleBid = () => {
-    socketRef.current.emit('newBid', { amount: parseInt(newBid), user });
-    setNewBid('');
-  };
-
+  // Lógica de login
   const handleLogin = () => {
     fetch('http://localhost:3000/authenticate', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ cpf, publicKey }),
     })
-      .then((response) => {
-        if (!response.ok) {
-          throw new Error('Erro na autenticação. Servidor retornou um erro.');
-        }
-        return response.json();
+      .then((res) => {
+        if (!res.ok) throw new Error('Erro na autenticação.');
+        return res.json();
       })
       .then((data) => {
         if (data.success) {
           console.log('Autenticação bem-sucedida.');
-          setUser(data.user.nome);
+
+          // Descriptografar a chave simétrica e os dados
+          const privateKey = localStorage.getItem('privateKey');
+          const decryptedSymmetricKey = decryptWithPrivateKey(privateKey, data.encryptedSymmetricKey);
+          const decryptedUserInfo = decryptWithPrivateKey(privateKey, data.encryptedUserInfo);
+          const decryptedMulticastAddress = decryptWithPrivateKey(privateKey, data.encryptedMulticastAddress);
+          const userInfo = JSON.parse(decryptedUserInfo);
+
+          // Setando o estado para uso na interface
+          setSymmetricKey(decryptedSymmetricKey);
+          setUser(userInfo.nome);
+          setMulticastAddress(decryptedMulticastAddress);
+
           setIsAuthenticated(true);
         } else {
           alert('Autenticação falhou: ' + data.message);
@@ -102,42 +85,52 @@ const AuctionClient = () => {
       });
   };
 
+  // Efeito para gerar chaves ao carregar
   useEffect(() => {
-    if (!isAuthenticated) {
-      generateKeyPair();
+    if (!isAuthenticated) generateKeyPair();
+  }, [isAuthenticated]);
+
+  // Efeito para conectar ao socket após autenticação
+  useEffect(() => {
+    if (isAuthenticated) {
+      console.log('Autenticado. Conectando ao multicast...');
+      socketRef.current = io('http://localhost:3000');
+
+      socketRef.current.on('currentItem', (item) => {
+        setCurrentItem(item);
+      });
+
+      return () => {
+        socketRef.current.disconnect();
+      };
     }
   }, [isAuthenticated]);
 
   if (!isAuthenticated) {
     return (
-      <>
-        <div>
-          <h1>Digite seu nome de usuário</h1>
-          <input
-            type="text"
-            value={user}
-            onChange={(e) => setUser(e.target.value)}
-            placeholder="Nome de usuário"
-          />
-        </div>
-        <div>
-          <h1>Digite o CPF:</h1>
-          <input
-            type="text"
-            value={cpf}
-            onChange={(e) => setCPF(e.target.value)}
-            placeholder="CPF do usuário"
-          />
-          <button onClick={handleLogin}>Entrar</button>
-        </div>
-      </>
+      <div>
+        <h1>Login</h1>
+        <input
+          type="text"
+          value={user}
+          onChange={(e) => setUser(e.target.value)}
+          placeholder="Nome"
+        />
+        <input
+          type="text"
+          value={cpf}
+          onChange={(e) => setCPF(e.target.value)}
+          placeholder="CPF"
+        />
+        <button onClick={handleLogin}>Entrar</button>
+      </div>
     );
   }
 
   return (
     <div>
       <h1>Leilão Atual</h1>
-      {currentItem && (
+      {currentItem ? (
         <div>
           <p>Item: {currentItem.description}</p>
           <p>Lance Inicial: {currentItem.initialBid}</p>
@@ -149,10 +142,14 @@ const AuctionClient = () => {
             onChange={(e) => setNewBid(e.target.value)}
             placeholder="Digite seu lance"
           />
-          <button onClick={handleBid}>Dar Lance</button>
+          <button onClick={() => socketRef.current.emit('newBid', { amount: parseInt(newBid), user })}>
+            Dar Lance
+          </button>
         </div>
+      ) : (
+        <p>Carregando item...</p>
       )}
-      <button onClick={clearSession}>Sair</button>
+      <button onClick={() => setIsAuthenticated(false)}>Sair</button>
     </div>
   );
 };
